@@ -1,5 +1,10 @@
 // Vercel serverless function: /api/chat
-// Env vars: GEMINI_API_KEY (required), GEMINI_MODEL (optional, default gemini-2.5-flash)
+// Env vars: GEMINI_API_KEY (required), GEMINI_MODEL (optional), GEMINI_FALLBACK_MODEL (optional)
+
+export const config = { maxDuration: 60 };
+
+const DEFAULT_MODEL = 'gemini-3.8-flash';
+const API = 'https://generativelanguage.googleapis.com/v1beta';
 
 const LANG = {
   en: 'English',
@@ -9,21 +14,111 @@ const LANG = {
 };
 
 const clip = (s, n) => String(s || '').slice(0, n);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function gemini(system, contents, temperature) {
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const isBusy = (status, msg) =>
+  [429, 500, 502, 503, 504].includes(status) || /high demand|overloaded|try again later|temporarily/i.test(msg || '');
+
+// One single call to one model. Throws an error with .busy = true if retrying makes sense.
+async function callModel(model, system, contents, temperature) {
   const generationConfig = { responseMimeType: 'application/json', temperature };
   if (model.includes('2.5') && model.includes('flash')) generationConfig.thinkingConfig = { thinkingBudget: 0 };
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig }),
-  });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data?.error?.message || 'Gemini error');
+
+  let r;
+  try {
+    r = await fetch(`${API}/models/${model}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig }),
+    });
+  } catch (e) {
+    const err = new Error('Network error');
+    err.busy = true;
+    throw err;
+  }
+
+  let data = {};
+  try { data = await r.json(); } catch {}
+  if (!r.ok) {
+    const msg = data?.error?.message || 'Gemini error';
+    const err = new Error(msg);
+    err.status = r.status;
+    err.busy = isBusy(r.status, msg);
+    throw err;
+  }
+
   const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+  if (!text.trim()) {
+    const err = new Error('Empty response');
+    err.busy = true;
+    throw err;
+  }
   const clean = text.replace(/```json|```/g, '').trim();
   try { return JSON.parse(clean); } catch { return { _raw: clean }; }
+}
+
+// Asks Google which Flash models this key can use (only used when the main models fail).
+let cachedModels = null;
+async function discoverModels() {
+  if (cachedModels) return cachedModels;
+  try {
+    const r = await fetch(`${API}/models?pageSize=200`, { headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY } });
+    const d = await r.json();
+    const names = (d.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map((m) => String(m.name || '').replace('models/', ''))
+      .filter((n) => /flash/i.test(n) && !/image|tts|audio|live|native|robotics|computer|embed/i.test(n));
+    const stable = names.filter((n) => !/preview|exp/i.test(n));
+    const rest = names.filter((n) => /preview|exp/i.test(n));
+    const sort = (a, b) => b.localeCompare(a, undefined, { numeric: true });
+    cachedModels = [...stable.sort(sort), ...rest.sort(sort)];
+  } catch {
+    cachedModels = [];
+  }
+  return cachedModels;
+}
+
+function friendly(e) {
+  const msg = (e && e.message) || '';
+  if (e && e.status === 429 && /quota|limit/i.test(msg)) return 'Free usage limit reached for now. Please wait a few minutes and try again.';
+  if (e && e.busy) return 'The AI is busy right now. Please wait a minute and try again.';
+  return msg || 'Server error';
+}
+
+// Tries the main model (with retries), then backup models.
+async function gemini(system, contents, temperature) {
+  const deadline = Date.now() + 40000;
+  const queue = [(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim()];
+  if (process.env.GEMINI_FALLBACK_MODEL) queue.push(process.env.GEMINI_FALLBACK_MODEL.trim());
+  const tried = new Set();
+  let discovered = false;
+  let lastErr = null;
+
+  while (queue.length || !discovered) {
+    if (!queue.length) {
+      discovered = true;
+      const list = await discoverModels();
+      queue.push(...list.filter((m) => !tried.has(m)).slice(0, 3));
+      if (!queue.length) break;
+    }
+    const model = queue.shift();
+    if (!model || tried.has(model)) continue;
+    tried.add(model);
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await callModel(model, system, contents, temperature);
+      } catch (e) {
+        lastErr = e;
+        if (!e.busy) break; // not a busy error: go to the next model
+        const wait = 1500 * (attempt + 1);
+        if (attempt === 2 || Date.now() + wait > deadline) break;
+        await sleep(wait);
+      }
+    }
+    if (Date.now() > deadline) break;
+  }
+  throw new Error(friendly(lastErr));
 }
 
 export default async function handler(req, res) {
